@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """Download all CHI 2026 PDFs from ACM DL via real Chrome (Cloudflare-aware).
 
-Usage: python download_pdfs.py --types=paper,poster --delay=2
+One Chrome context clears Cloudflare once, then N workers fetch PDFs in
+parallel sharing the cookie jar via Playwright's async APIRequestContext.
 
-Requires: playwright, playwright_stealth. Uses your installed Chrome.app.
+Usage: python download_pdfs.py --types=paper --concurrency=6 --delay=0.3
 """
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import re
 import signal
@@ -16,7 +18,7 @@ import time
 from pathlib import Path
 from urllib.parse import quote
 
-from playwright.sync_api import sync_playwright
+from playwright.async_api import async_playwright
 from playwright_stealth import Stealth
 
 ROOT = Path(__file__).resolve().parent
@@ -58,7 +60,6 @@ def load_entries(types: set[int] | None) -> list[dict]:
             "title": c.get("title", ""),
             "type": TYPE_NAMES.get(c.get("typeId"), str(c.get("typeId"))),
         })
-    # Dedup by doi
     seen, dedup = set(), []
     for e in out:
         if e["doi"] in seen:
@@ -68,39 +69,103 @@ def load_entries(types: set[int] | None) -> list[dict]:
     return dedup
 
 
-def clear_cloudflare(page, landing_url: str, max_wait: int = 60) -> bool:
-    """Navigate to a DOI landing page and wait for Cloudflare challenge to clear."""
-    page.goto(landing_url, wait_until="domcontentloaded", timeout=60000)
+async def clear_cloudflare(page, landing_url: str, max_wait: int = 60) -> bool:
+    await page.goto(landing_url, wait_until="domcontentloaded", timeout=60000)
     start = time.time()
     while time.time() - start < max_wait:
-        t = page.title() or ""
+        t = await page.title() or ""
         if t and "Just a moment" not in t and "Cloudflare" not in t:
             return True
-        time.sleep(1.0)
+        await asyncio.sleep(1.0)
     return False
 
 
-def fetch_pdf(ctx, doi: str) -> tuple[int, bytes, str]:
-    url = f"https://dl.acm.org/doi/pdf/{quote(doi, safe='/')}"
-    r = ctx.request.get(url, headers={
-        "Referer": f"https://dl.acm.org/doi/{doi}",
-        "Accept": "application/pdf,*/*",
-    })
-    body = r.body()
-    return r.status, body, r.headers.get("content-type", "")
+class Counter:
+    def __init__(self, total: int):
+        self.total = total
+        self.done = 0
+        self.ok = 0
+        self.fail = 0
+        self.skip = 0
+        self.lock = asyncio.Lock()
+        self.log_f = open(LOG_PATH, "a")
+        self.fail_f = open(FAIL_PATH, "a")
+
+    async def record(self, kind: str, line: str, fail_row: str | None = None):
+        async with self.lock:
+            self.done += 1
+            if kind == "ok":
+                self.ok += 1
+            elif kind == "skip":
+                self.skip += 1
+            else:
+                self.fail += 1
+                if fail_row:
+                    self.fail_f.write(fail_row + "\n")
+                    self.fail_f.flush()
+            stamp = time.strftime("%H:%M:%S")
+            msg = f"[{stamp}] {self.done}/{self.total} ok={self.ok} skip={self.skip} fail={self.fail} | {line}"
+            print(msg, flush=True)
+            self.log_f.write(msg + "\n")
+            self.log_f.flush()
+
+    def close(self):
+        self.log_f.close()
+        self.fail_f.close()
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--types", default="paper",
-                    help="comma list: paper,poster,journal,demo,panel,keynote,award,workshop,course,all")
-    ap.add_argument("--delay", type=float, default=2.0, help="seconds between downloads")
-    ap.add_argument("--limit", type=int, default=0)
-    ap.add_argument("--out", default=str(OUT_DIR))
-    ap.add_argument("--headless", action="store_true",
-                    help="try headless (often blocked by CF; default headful)")
-    args = ap.parse_args()
+async def download_one(ctx, page, page_lock, entry: dict, out_dir: Path,
+                        counter: Counter, sem: asyncio.Semaphore,
+                        delay: float, stop_flag: dict):
+    async with sem:
+        if stop_flag["stop"]:
+            return
+        fname = f"{safe_filename(entry['title'])} [{entry['doi'].replace('/', '_')}].pdf"
+        path = out_dir / fname
 
+        if path.exists() and path.stat().st_size > 1000:
+            await counter.record("skip", f"skip: {fname}")
+            return
+
+        url = f"https://dl.acm.org/doi/pdf/{quote(entry['doi'], safe='/')}"
+        last_err = ""
+        for attempt in range(1, 4):
+            try:
+                r = await ctx.request.get(url, headers={
+                    "Referer": f"https://dl.acm.org/doi/{entry['doi']}",
+                    "Accept": "application/pdf,*/*",
+                }, timeout=90000)
+                body = await r.body()
+                ct = r.headers.get("content-type", "")
+                if r.status == 200 and body[:4] == b"%PDF":
+                    tmp = path.with_suffix(".pdf.part")
+                    tmp.write_bytes(body)
+                    tmp.rename(path)
+                    await counter.record("ok", f"ok: {fname} ({len(body)} bytes)")
+                    if delay > 0:
+                        await asyncio.sleep(delay)
+                    return
+                last_err = f"HTTP {r.status} ct={ct} len={len(body)}"
+                # Cloudflare re-challenge → one worker re-clears for everyone
+                if r.status in (403, 429, 503) or body[:200].find(b"Just a moment") >= 0:
+                    async with page_lock:
+                        # Double-check we still need to clear (another worker may have done it)
+                        cur_title = await page.title() if page.url != "about:blank" else ""
+                        if "Just a moment" in cur_title or attempt > 1:
+                            await clear_cloudflare(page, f"https://dl.acm.org/doi/{entry['doi']}")
+                    await asyncio.sleep(1.0 * attempt)
+            except Exception as ex:
+                last_err = f"{type(ex).__name__}: {ex}"
+                await asyncio.sleep(1.5 * attempt)
+
+        await counter.record(
+            "fail",
+            f"FAIL {entry['doi']}: {last_err}",
+            fail_row=f"{entry['doi']}\t{entry['title']}\t{last_err}",
+        )
+
+
+async def main_async(args):
     name_to_id = {v.lower(): k for k, v in TYPE_NAMES.items()}
     if args.types.strip().lower() == "all":
         types = None
@@ -115,84 +180,65 @@ def main():
     entries = load_entries(types)
     if args.limit:
         entries = entries[: args.limit]
-    print(f"Loaded {len(entries)} entries (types={args.types})")
+    print(f"Loaded {len(entries)} entries (types={args.types}) concurrency={args.concurrency}")
 
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
     PROFILE_DIR.mkdir(exist_ok=True)
 
-    stop = {"flag": False}
-    def _sigint(*_):
-        stop["flag"] = True
-        print("\n[SIGINT] finishing current download then exiting…")
-    signal.signal(signal.SIGINT, _sigint)
+    counter = Counter(len(entries))
+    stop_flag = {"stop": False}
 
-    ok = fail = skipped = 0
-    with Stealth().use_sync(sync_playwright()) as p, \
-            open(LOG_PATH, "a") as log, open(FAIL_PATH, "a") as fail_f:
-        ctx = p.chromium.launch_persistent_context(
+    loop = asyncio.get_event_loop()
+    def _sigint(*_):
+        stop_flag["stop"] = True
+        print("\n[SIGINT] stopping after in-flight downloads…", flush=True)
+    loop.add_signal_handler(signal.SIGINT, _sigint)
+
+    async with Stealth().use_async(async_playwright()) as p:
+        ctx = await p.chromium.launch_persistent_context(
             str(PROFILE_DIR),
             channel="chrome",
             headless=args.headless,
             viewport={"width": 1280, "height": 900},
             args=["--disable-blink-features=AutomationControlled"],
         )
-        page = ctx.pages[0] if ctx.pages else ctx.new_page()
+        page = ctx.pages[0] if ctx.pages else await ctx.new_page()
+        page_lock = asyncio.Lock()
 
-        # Establish cf_clearance with first DOI
-        first_doi = entries[0]["doi"]
-        print(f"[init] clearing Cloudflare on {first_doi} …")
-        if not clear_cloudflare(page, f"https://dl.acm.org/doi/{first_doi}"):
+        print(f"[init] clearing Cloudflare on {entries[0]['doi']} …")
+        if not await clear_cloudflare(page, f"https://dl.acm.org/doi/{entries[0]['doi']}"):
             print("WARNING: Cloudflare not cleared within timeout; continuing anyway")
 
-        for i, e in enumerate(entries, 1):
-            if stop["flag"]:
-                break
-            fname = f"{safe_filename(e['title'])} [{e['doi'].replace('/', '_')}].pdf"
-            path = out_dir / fname
-            stamp = time.strftime("%H:%M:%S")
+        sem = asyncio.Semaphore(args.concurrency)
+        tasks = [
+            asyncio.create_task(download_one(ctx, page, page_lock, e, out_dir,
+                                              counter, sem, args.delay, stop_flag))
+            for e in entries
+        ]
+        try:
+            await asyncio.gather(*tasks)
+        finally:
+            counter.close()
+            await ctx.close()
 
-            if path.exists() and path.stat().st_size > 1000:
-                skipped += 1
-                line = f"[{stamp}] {i}/{len(entries)} skip: {fname}"
-                print(line); log.write(line + "\n"); log.flush()
-                continue
+    print(f"\nDone. ok={counter.ok} fail={counter.fail} skip={counter.skip} out={out_dir}")
 
-            success = False
-            last_err = ""
-            for attempt in range(1, 4):
-                try:
-                    status, body, ct = fetch_pdf(ctx, e["doi"])
-                    if status == 200 and body[:4] == b"%PDF":
-                        tmp = path.with_suffix(".pdf.part")
-                        tmp.write_bytes(body)
-                        tmp.rename(path)
-                        success = True
-                        last_err = f"ok {len(body)} bytes"
-                        break
-                    last_err = f"HTTP {status} ct={ct} len={len(body)}"
-                    # Likely re-challenged by CF → re-navigate landing page
-                    if status in (403, 429, 503) or b"Just a moment" in body[:200]:
-                        print(f"  [retry {attempt}] re-clearing Cloudflare…")
-                        clear_cloudflare(page, f"https://dl.acm.org/doi/{e['doi']}")
-                        time.sleep(2 * attempt)
-                except Exception as ex:
-                    last_err = f"{type(ex).__name__}: {ex}"
-                    time.sleep(2 * attempt)
 
-            if success:
-                ok += 1
-                line = f"[{stamp}] {i}/{len(entries)} ok: {fname}"
-            else:
-                fail += 1
-                fail_f.write(f"{e['doi']}\t{e['title']}\t{last_err}\n"); fail_f.flush()
-                line = f"[{stamp}] {i}/{len(entries)} FAIL {e['doi']}: {last_err}"
-            print(line); log.write(line + "\n"); log.flush()
-            time.sleep(args.delay)
-
-        ctx.close()
-
-    print(f"\nDone. ok={ok} fail={fail} skip={skipped} out={out_dir}")
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--types", default="paper",
+                    help="comma list: paper,poster,journal,demo,panel,keynote,award,workshop,course,all")
+    ap.add_argument("--concurrency", type=int, default=6,
+                    help="parallel in-flight downloads (default 6)")
+    ap.add_argument("--delay", type=float, default=0.3,
+                    help="per-worker delay after each success (seconds)")
+    ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--out", default=str(OUT_DIR))
+    ap.add_argument("--headless", action="store_true",
+                    help="try headless (usually blocked by CF; default headful)")
+    args = ap.parse_args()
+    asyncio.run(main_async(args))
 
 
 if __name__ == "__main__":
