@@ -19,3 +19,4 @@ failed.tsv
 .vscode/
 .idea/
 *.swp
+*.tsv

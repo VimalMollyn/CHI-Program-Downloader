@@ -25,7 +25,7 @@ ACM DL is behind Cloudflare. The following approaches **all fail** (don't waste 
 
 **What works:** Playwright `launch_persistent_context(channel="chrome", headless=False)` + `playwright-stealth` + `--disable-blink-features=AutomationControlled`. The key is using the installed `/Applications/Google Chrome.app`, not the bundled Chromium.
 
-The Cloudflare `cf_clearance` cookie is set after the first successful navigation and stays valid for the whole run; subsequent PDFs are fetched via `ctx.request.get()` which reuses the cookie jar.
+**Critical gotcha — how PDFs are fetched:** Cloudflare fingerprints Playwright's `APIRequestContext` (`ctx.request.get`) differently from real browser fetches and **blocks the PDF endpoint** even after the session is warm. The HTML abstract pages work fine via `ctx.request`, but `GET /doi/pdf/<doi>` returns CF challenge pages. The fix: run the fetch **inside the page's JS context** via `page.evaluate('fetch(...)')`, then base64 the `ArrayBuffer` back out. That uses Chrome's real TLS fingerprint and passes CF. This is what `FETCH_JS` in the script does — don't "simplify" it back to `ctx.request.get`.
 
 ## Requirements
 
@@ -131,6 +131,15 @@ failed.tsv         # doi<TAB>title<TAB>last_error — re-runnable by filtering t
 ```
 
 Filenames: title is sanitized (bad chars → `_`, truncated to 120 chars) and the DOI (with `/` → `_`) is appended in brackets as a stable ID.
+
+## ⚠️ ACM IP-ban threshold
+
+**Do not exceed `--concurrency=4`.** Empirically:
+
+- `c=1, delay=2` → ran 171 papers, no issues.
+- `c=6, delay=0.3` → downloaded ~600 more, then ACM served `HTTP 403 "ACM Error: IP blocked"` (title), distinct from Cloudflare's "Just a moment…" page. Block lifts in hours but can require emailing `[email protected]`.
+
+The script now detects the IP-block page by string match and aborts the run instead of hammering. Defaults are `--concurrency=2 --delay=1.5` (~2–3 s/paper, ~90 min for all 1702 papers). If you need to go faster, use a CMU/institutional VPN — those IPs aren't rate-limited the same way.
 
 ## Troubleshooting
 

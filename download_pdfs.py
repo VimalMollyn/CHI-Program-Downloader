@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import json
 import re
 import signal
@@ -114,55 +115,76 @@ class Counter:
         self.fail_f.close()
 
 
-async def download_one(ctx, page, page_lock, entry: dict, out_dir: Path,
-                        counter: Counter, sem: asyncio.Semaphore,
-                        delay: float, stop_flag: dict):
-    async with sem:
-        if stop_flag["stop"]:
-            return
-        fname = f"{safe_filename(entry['title'])} [{entry['doi'].replace('/', '_')}].pdf"
-        path = out_dir / fname
+FETCH_JS = """async (url) => {
+    const r = await fetch(url, {credentials: 'include'});
+    const buf = new Uint8Array(await r.arrayBuffer());
+    let s = '';
+    const CHUNK = 0x8000;
+    for (let i = 0; i < buf.length; i += CHUNK) {
+        s += String.fromCharCode.apply(null, buf.subarray(i, i + CHUNK));
+    }
+    return {status: r.status, ct: r.headers.get('content-type') || '', b64: btoa(s)};
+}"""
 
-        if path.exists() and path.stat().st_size > 1000:
-            await counter.record("skip", f"skip: {fname}")
-            return
 
-        url = f"https://dl.acm.org/doi/pdf/{quote(entry['doi'], safe='/')}"
-        last_err = ""
-        for attempt in range(1, 4):
-            try:
-                r = await ctx.request.get(url, headers={
-                    "Referer": f"https://dl.acm.org/doi/{entry['doi']}",
-                    "Accept": "application/pdf,*/*",
-                }, timeout=90000)
-                body = await r.body()
-                ct = r.headers.get("content-type", "")
-                if r.status == 200 and body[:4] == b"%PDF":
-                    tmp = path.with_suffix(".pdf.part")
-                    tmp.write_bytes(body)
-                    tmp.rename(path)
-                    await counter.record("ok", f"ok: {fname} ({len(body)} bytes)")
-                    if delay > 0:
-                        await asyncio.sleep(delay)
-                    return
-                last_err = f"HTTP {r.status} ct={ct} len={len(body)}"
-                # Cloudflare re-challenge → one worker re-clears for everyone
-                if r.status in (403, 429, 503) or body[:200].find(b"Just a moment") >= 0:
-                    async with page_lock:
-                        # Double-check we still need to clear (another worker may have done it)
-                        cur_title = await page.title() if page.url != "about:blank" else ""
-                        if "Just a moment" in cur_title or attempt > 1:
-                            await clear_cloudflare(page, f"https://dl.acm.org/doi/{entry['doi']}")
-                    await asyncio.sleep(1.0 * attempt)
-            except Exception as ex:
-                last_err = f"{type(ex).__name__}: {ex}"
-                await asyncio.sleep(1.5 * attempt)
+async def download_one(worker_page, page_lock, entry: dict, out_dir: Path,
+                        counter: Counter, delay: float, stop_flag: dict):
+    if stop_flag["stop"]:
+        return
+    fname = f"{safe_filename(entry['title'])} [{entry['doi'].replace('/', '_')}].pdf"
+    path = out_dir / fname
 
-        await counter.record(
-            "fail",
-            f"FAIL {entry['doi']}: {last_err}",
-            fail_row=f"{entry['doi']}\t{entry['title']}\t{last_err}",
-        )
+    if path.exists() and path.stat().st_size > 1000:
+        await counter.record("skip", f"skip: {fname}")
+        return
+
+    pdf_path = f"/doi/pdf/{quote(entry['doi'], safe='/')}"
+    last_err = ""
+    for attempt in range(1, 4):
+        try:
+            data = await worker_page.evaluate(FETCH_JS, pdf_path)
+            body = base64.b64decode(data["b64"])
+            ct = data["ct"]
+            status = data["status"]
+            if status == 200 and body[:4] == b"%PDF":
+                tmp = path.with_suffix(".pdf.part")
+                tmp.write_bytes(body)
+                tmp.rename(path)
+                await counter.record("ok", f"ok: {fname} ({len(body)} bytes)")
+                if delay > 0:
+                    await asyncio.sleep(delay)
+                return
+            last_err = f"HTTP {status} ct={ct} len={len(body)}"
+            if b"IP blocked" in body[:40000] or b"Your IP Address has been blocked" in body[:40000]:
+                stop_flag["stop"] = True
+                last_err = "ACM IP BLOCKED — aborting run; wait hours or switch network/VPN"
+                break
+            if status in (403, 429, 503) or body[:200].find(b"Just a moment") >= 0:
+                async with page_lock:
+                    await worker_page.goto(f"https://dl.acm.org/doi/{entry['doi']}", timeout=60000)
+                await asyncio.sleep(1.0 * attempt)
+        except Exception as ex:
+            last_err = f"{type(ex).__name__}: {ex}"
+            await asyncio.sleep(1.5 * attempt)
+
+    await counter.record(
+        "fail",
+        f"FAIL {entry['doi']}: {last_err}",
+        fail_row=f"{entry['doi']}\t{entry['title']}\t{last_err}",
+    )
+
+
+async def worker_loop(pool_page, page_lock, queue: asyncio.Queue, out_dir,
+                      counter, delay, stop_flag):
+    while True:
+        entry = await queue.get()
+        try:
+            if entry is None or stop_flag["stop"]:
+                return
+            await download_one(pool_page, page_lock, entry, out_dir,
+                               counter, delay, stop_flag)
+        finally:
+            queue.task_done()
 
 
 async def main_async(args):
@@ -203,21 +225,34 @@ async def main_async(args):
             viewport={"width": 1280, "height": 900},
             args=["--disable-blink-features=AutomationControlled"],
         )
-        page = ctx.pages[0] if ctx.pages else await ctx.new_page()
+        first_page = ctx.pages[0] if ctx.pages else await ctx.new_page()
         page_lock = asyncio.Lock()
 
-        print(f"[init] clearing Cloudflare on {entries[0]['doi']} …")
-        if not await clear_cloudflare(page, f"https://dl.acm.org/doi/{entries[0]['doi']}"):
-            print("WARNING: Cloudflare not cleared within timeout; continuing anyway")
+        print(f"[init] warming session on {entries[0]['doi']} …")
+        await first_page.goto(f"https://dl.acm.org/doi/{entries[0]['doi']}", timeout=60000)
+        # brief wait in case CF puts up challenge
+        await clear_cloudflare(first_page, first_page.url)
 
-        sem = asyncio.Semaphore(args.concurrency)
-        tasks = [
-            asyncio.create_task(download_one(ctx, page, page_lock, e, out_dir,
-                                              counter, sem, args.delay, stop_flag))
-            for e in entries
+        # One page per worker — each shares the context's cookie jar
+        worker_pages = [first_page]
+        for _ in range(args.concurrency - 1):
+            wp = await ctx.new_page()
+            await wp.goto(f"https://dl.acm.org/doi/{entries[0]['doi']}", timeout=60000)
+            worker_pages.append(wp)
+
+        queue: asyncio.Queue = asyncio.Queue()
+        for e in entries:
+            queue.put_nowait(e)
+        for _ in range(args.concurrency):
+            queue.put_nowait(None)  # sentinel per worker
+
+        workers = [
+            asyncio.create_task(worker_loop(wp, page_lock, queue, out_dir,
+                                             counter, args.delay, stop_flag))
+            for wp in worker_pages
         ]
         try:
-            await asyncio.gather(*tasks)
+            await asyncio.gather(*workers)
         finally:
             counter.close()
             await ctx.close()
@@ -229,9 +264,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--types", default="paper",
                     help="comma list: paper,poster,journal,demo,panel,keynote,award,workshop,course,all")
-    ap.add_argument("--concurrency", type=int, default=6,
-                    help="parallel in-flight downloads (default 6)")
-    ap.add_argument("--delay", type=float, default=0.3,
+    ap.add_argument("--concurrency", type=int, default=2,
+                    help="parallel in-flight downloads (default 2 — ACM IP-bans at >4)")
+    ap.add_argument("--delay", type=float, default=1.5,
                     help="per-worker delay after each success (seconds)")
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--out", default=str(OUT_DIR))
