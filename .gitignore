@@ -1,0 +1,21 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Downloads & runtime state
+pdfs/
+*.pdf
+*.pdf.part
+.chrome-profile/
+download.log
+failed.tsv
+
+# macOS
+.DS_Store
+
+# Editors
+.vscode/
+.idea/
+*.swp

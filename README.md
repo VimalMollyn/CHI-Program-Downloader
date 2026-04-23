@@ -1,0 +1,150 @@
+# CHI 2026 PDF Bulk Downloader
+
+Downloads every CHI 2026 paper (and optionally posters, journals, demos, etc.)
+from the ACM Digital Library using DOIs extracted from the SIGCHI program JSON.
+
+## TL;DR for another LLM
+
+- Input: `CHI_2026_program.json` (from https://programs.sigchi.org/chi/2026 — saved in this repo).
+- Script: `download_pdfs.py`.
+- Mechanism: launches **real Google Chrome** via Playwright with `playwright-stealth` and a persistent profile, clears one Cloudflare challenge, then pulls PDFs via the shared cookie jar.
+- Output: `pdfs/<safe-title> [<doi-with-underscores>].pdf`. Logs → `download.log`. Failures → `failed.tsv`. Re-running skips already-downloaded files.
+
+## Why this is harder than it looks
+
+ACM DL is behind Cloudflare. The following approaches **all fail** (don't waste time trying them again):
+
+| Approach | Result |
+|---|---|
+| `requests` with browser UA | 403 Cloudflare challenge |
+| `curl_cffi` (Chrome impersonation) | 403 |
+| `cloudscraper` | 403 |
+| Headless Playwright Chromium + stealth | Stuck on "Just a moment…" |
+| Headful Playwright Chromium + stealth | Stuck on "Just a moment…" |
+| `nodriver` (undetected-chromedriver successor) | CDP connect failure on macOS |
+
+**What works:** Playwright `launch_persistent_context(channel="chrome", headless=False)` + `playwright-stealth` + `--disable-blink-features=AutomationControlled`. The key is using the installed `/Applications/Google Chrome.app`, not the bundled Chromium.
+
+The Cloudflare `cf_clearance` cookie is set after the first successful navigation and stays valid for the whole run; subsequent PDFs are fetched via `ctx.request.get()` which reuses the cookie jar.
+
+## Requirements
+
+- macOS (tested on Darwin 24.5, Apple Silicon). Should work on Linux with a real Chrome/Chromium.
+- Google Chrome installed at `/Applications/Google Chrome.app` (any recent version).
+- Python 3.11+.
+- ~15 GB of disk for all 1702 papers (average ~3–8 MB each; some up to 30 MB).
+- Network: a stable connection. Run gets rate-shaped if you go faster than ~1 req/sec.
+
+## Setup
+
+```bash
+cd /path/to/CHI2026
+
+python3 -m venv .venv
+.venv/bin/pip install -q playwright playwright-stealth
+.venv/bin/playwright install chromium   # optional — the script actually uses system Chrome
+```
+
+Nothing else. `requests`, `curl_cffi`, `cloudscraper`, `nodriver` are **not** needed — don't install them.
+
+## Input data
+
+`CHI_2026_program.json` — the full program export from
+`https://programs.sigchi.org/chi/2026` (JSON download button in the UI, or the
+"Export" endpoint). Structure (relevant fields only):
+
+```jsonc
+{
+  "contents": [
+    {
+      "id": 214789,
+      "typeId": 14694,           // 14694 = Paper, 14743 = Poster, …
+      "title": "…",
+      "addons": {
+        "doi": { "url": "https://doi.org/10.1145/3772318.3790431" }
+      }
+    },
+    …
+  ],
+  "contentTypes": [ { "id": 14694, "name": "Paper" }, … ]
+}
+```
+
+Counts in the 2026 export:
+- 2782 total content items
+- 2721 have DOIs
+- 1702 Papers, 807 Posters, 67 Workshops, 40 Demos, 36 Journals, 32 Meetups, 12 SRC, 8 Panels, 5 Awards, 4 Keynotes, 69 Workshops, etc.
+
+## Usage
+
+```bash
+# Default: all 1702 Papers
+.venv/bin/python download_pdfs.py
+
+# Specific types (comma-separated)
+.venv/bin/python download_pdfs.py --types=paper,poster,journal
+
+# Everything with a DOI (~2721 entries)
+.venv/bin/python download_pdfs.py --types=all
+
+# Smoke test
+.venv/bin/python download_pdfs.py --types=paper --limit=3
+
+# Tune politeness (default 2s between downloads)
+.venv/bin/python download_pdfs.py --delay=3
+
+# Custom output dir
+.venv/bin/python download_pdfs.py --out=/some/other/dir
+```
+
+Valid `--types` values: `paper, poster, journal, demo, panel, keynote, award, workshop, course, meetup, src, mentoring, plaza, global, event, break, all`.
+
+### Running in background
+
+`download.log` is append-only, so you can `nohup` or `tmux` and come back:
+
+```bash
+nohup .venv/bin/python download_pdfs.py --types=paper > download.log 2>&1 &
+tail -f download.log
+```
+
+Re-running the same command after an interrupt **resumes** — existing PDFs in the output dir are skipped.
+
+## How it works
+
+1. **Load entries**: parse `CHI_2026_program.json`, filter by `typeId`, extract DOI from `addons.doi.url` via regex `10\.\d{4,9}/\S+`.
+2. **Launch Chrome**: `launch_persistent_context` with `channel="chrome"` so Cloudflare sees a real Chrome fingerprint. Profile lives in `.chrome-profile/` (cf_clearance persists there between runs, but not long enough to matter — CF re-issues it quickly).
+3. **Clear Cloudflare**: navigate to `https://dl.acm.org/doi/<first-doi>`, wait for the page title to stop being "Just a moment…" (usually 2–5 s).
+4. **Download loop**: for each DOI, `ctx.request.get("https://dl.acm.org/doi/pdf/<doi>")`. This reuses the browser's cookie jar (including `cf_clearance`) but doesn't render, so it's fast.
+5. **Validate**: confirm HTTP 200 and `body[:4] == b"%PDF"`. If not, re-navigate the landing page to re-clear CF and retry (up to 3 attempts).
+6. **Write atomically**: write to `…pdf.part`, then rename.
+
+## Output
+
+```
+pdfs/
+  Rethinking External Communication of Autonomous Vehicles_ … [10.1145_3772318.3790431].pdf
+  …
+download.log       # one line per attempt, timestamped
+failed.tsv         # doi<TAB>title<TAB>last_error — re-runnable by filtering the JSON to these DOIs
+.chrome-profile/   # Playwright's persistent Chrome profile (keep or delete, doesn't matter much)
+```
+
+Filenames: title is sanitized (bad chars → `_`, truncated to 120 chars) and the DOI (with `/` → `_`) is appended in brackets as a stable ID.
+
+## Troubleshooting
+
+- **Everything returns 403 / "Just a moment…"**: Chrome isn't installed at `/Applications/Google Chrome.app`, or you're running headless. The script forces `headless=False` by default — don't pass `--headless`.
+- **`Failed to connect to browser`**: This is the nodriver error. You're looking at the wrong branch of the git history, or someone re-introduced nodriver. The working path is Playwright-only.
+- **Partial PDFs**: look for `*.pdf.part` files — these are interrupted writes. The script cleans these up; if one remains, delete it and rerun.
+- **Rate-limited mid-run**: ACM starts returning HTML wrappers instead of PDFs. The script auto-re-navigates to clear CF. If it persists, increase `--delay` to 5+ and restart.
+- **Python requests the package `requests`**: you're on an old version of the script. The current script only needs `playwright` + `playwright-stealth`.
+
+## Why not Zotero?
+
+Zotero can do this too (import DOIs → "Find Available PDFs"), but also routes through Cloudflare and is manual per-batch. This script is ~3× faster and scriptable. The user's original suggestion (bulk BibTeX export × 7 → Zotero) works but is more clicks.
+
+## License / Ethics note
+
+CHI proceedings are Gold Open Access on ACM DL since 2025 — PDFs are freely
+redistributable under CC-BY. Run with a polite delay (default 2s).
