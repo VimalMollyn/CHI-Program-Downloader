@@ -9,8 +9,8 @@ pdfs/
 *.pdf
 *.pdf.part
 .chrome-profile/
-download.log
-failed.tsv
+*.download.log
+*.failed.tsv
 
 # macOS
 .DS_Store

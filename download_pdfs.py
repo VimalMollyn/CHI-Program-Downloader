@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Download all CHI 2026 PDFs from ACM DL via real Chrome (Cloudflare-aware).
+"""Download SIGCHI-event PDFs from ACM DL via real Chrome (Cloudflare-aware).
 
+Works against any programs.sigchi.org JSON export (CHI, CSCW, UIST, …).
 One Chrome context clears Cloudflare once, then N workers fetch PDFs in
 parallel sharing the cookie jar via Playwright's async APIRequestContext.
 
-Usage: python download_pdfs.py --types=paper --concurrency=6 --delay=0.3
+Usage: python download_pdfs.py path/to/program.json --types=paper
 """
 from __future__ import annotations
 
@@ -23,18 +24,7 @@ from playwright.async_api import async_playwright
 from playwright_stealth import Stealth
 
 ROOT = Path(__file__).resolve().parent
-JSON_PATH = ROOT / "CHI_2026_program.json"
-OUT_DIR = ROOT / "pdfs"
-LOG_PATH = ROOT / "download.log"
-FAIL_PATH = ROOT / "failed.tsv"
 PROFILE_DIR = ROOT / ".chrome-profile"
-
-TYPE_NAMES = {
-    14689: "Course", 14692: "Event", 14694: "Paper", 14697: "Workshop",
-    14698: "Break", 14739: "Journal", 14740: "Demo", 14741: "Keynote",
-    14742: "Meetup", 14743: "Poster", 14744: "Panel", 14746: "SRC",
-    14805: "Award", 14839: "Mentoring", 14889: "Plaza", 14914: "Global",
-}
 
 
 def safe_filename(s: str, max_len: int = 120) -> str:
@@ -43,8 +33,14 @@ def safe_filename(s: str, max_len: int = 120) -> str:
     return s[:max_len] if len(s) > max_len else s
 
 
-def load_entries(types: set[int] | None) -> list[dict]:
-    data = json.loads(JSON_PATH.read_text())
+def load_program(json_path: Path) -> tuple[dict, dict[int, str]]:
+    data = json.loads(json_path.read_text())
+    type_names = {t["id"]: t.get("name", str(t["id"])) for t in data.get("contentTypes", [])}
+    return data, type_names
+
+
+def load_entries(data: dict, type_names: dict[int, str],
+                 types: set[int] | None) -> list[dict]:
     out = []
     for c in data.get("contents", []):
         if types is not None and c.get("typeId") not in types:
@@ -59,7 +55,7 @@ def load_entries(types: set[int] | None) -> list[dict]:
             "id": c["id"],
             "doi": doi,
             "title": c.get("title", ""),
-            "type": TYPE_NAMES.get(c.get("typeId"), str(c.get("typeId"))),
+            "type": type_names.get(c.get("typeId"), str(c.get("typeId"))),
         })
     seen, dedup = set(), []
     for e in out:
@@ -82,15 +78,15 @@ async def clear_cloudflare(page, landing_url: str, max_wait: int = 60) -> bool:
 
 
 class Counter:
-    def __init__(self, total: int):
+    def __init__(self, total: int, log_path: Path, fail_path: Path):
         self.total = total
         self.done = 0
         self.ok = 0
         self.fail = 0
         self.skip = 0
         self.lock = asyncio.Lock()
-        self.log_f = open(LOG_PATH, "a")
-        self.fail_f = open(FAIL_PATH, "a")
+        self.log_f = open(log_path, "a")
+        self.fail_f = open(fail_path, "a")
 
     async def record(self, kind: str, line: str, fail_row: str | None = None):
         async with self.lock:
@@ -188,7 +184,13 @@ async def worker_loop(pool_page, page_lock, queue: asyncio.Queue, out_dir,
 
 
 async def main_async(args):
-    name_to_id = {v.lower(): k for k, v in TYPE_NAMES.items()}
+    json_path = Path(args.program).expanduser().resolve()
+    if not json_path.exists():
+        print(f"Program JSON not found: {json_path}", file=sys.stderr)
+        sys.exit(2)
+
+    data, type_names = load_program(json_path)
+    name_to_id = {v.lower(): k for k, v in type_names.items()}
     if args.types.strip().lower() == "all":
         types = None
     else:
@@ -199,16 +201,23 @@ async def main_async(args):
             print(f"Unknown type: {e}. Valid: {sorted(name_to_id)} or 'all'", file=sys.stderr)
             sys.exit(2)
 
-    entries = load_entries(types)
+    entries = load_entries(data, type_names, types)
     if args.limit:
         entries = entries[: args.limit]
-    print(f"Loaded {len(entries)} entries (types={args.types}) concurrency={args.concurrency}")
+    print(f"Loaded {len(entries)} entries from {json_path.name} "
+          f"(types={args.types}) concurrency={args.concurrency}")
+    if not entries:
+        print("No entries matched — nothing to do.", file=sys.stderr)
+        sys.exit(0)
 
-    out_dir = Path(args.out)
+    stem = json_path.stem
+    out_dir = Path(args.out) if args.out else ROOT / "pdfs" / stem
     out_dir.mkdir(parents=True, exist_ok=True)
+    log_path = Path(args.log) if args.log else ROOT / f"{stem}.download.log"
+    fail_path = Path(args.failed) if args.failed else ROOT / f"{stem}.failed.tsv"
     PROFILE_DIR.mkdir(exist_ok=True)
 
-    counter = Counter(len(entries))
+    counter = Counter(len(entries), log_path, fail_path)
     stop_flag = {"stop": False}
 
     loop = asyncio.get_event_loop()
@@ -261,15 +270,23 @@ async def main_async(args):
 
 
 def main():
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(
+        description="Bulk-download PDFs for any SIGCHI event from ACM DL.")
+    ap.add_argument("program", help="path to a programs.sigchi.org JSON export")
     ap.add_argument("--types", default="paper",
-                    help="comma list: paper,poster,journal,demo,panel,keynote,award,workshop,course,all")
+                    help="comma list of content-type names from the JSON "
+                         "(e.g. paper,poster,journal,demo,panel,keynote), or 'all'")
     ap.add_argument("--concurrency", type=int, default=2,
                     help="parallel in-flight downloads (default 2 — ACM IP-bans at >4)")
     ap.add_argument("--delay", type=float, default=1.5,
                     help="per-worker delay after each success (seconds)")
     ap.add_argument("--limit", type=int, default=0)
-    ap.add_argument("--out", default=str(OUT_DIR))
+    ap.add_argument("--out", default="",
+                    help="output dir (default: ./pdfs/<program-stem>/)")
+    ap.add_argument("--log", default="",
+                    help="log file (default: ./<program-stem>.download.log)")
+    ap.add_argument("--failed", default="",
+                    help="failed TSV (default: ./<program-stem>.failed.tsv)")
     ap.add_argument("--headless", action="store_true",
                     help="try headless (usually blocked by CF; default headful)")
     args = ap.parse_args()

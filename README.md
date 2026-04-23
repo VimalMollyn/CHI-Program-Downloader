@@ -1,14 +1,16 @@
-# CHI 2026 PDF Bulk Downloader
+# SIGCHI PDF Bulk Downloader
 
-Downloads every CHI 2026 paper (and optionally posters, journals, demos, etc.)
-from the ACM Digital Library using DOIs extracted from the SIGCHI program JSON.
+Downloads papers, posters, journal items, demos, etc. from the ACM Digital Library
+for any SIGCHI event (CHI, CSCW, UIST, …) using DOIs from the event's
+`programs.sigchi.org` JSON export.
 
 ## TL;DR for another LLM
 
-- Input: `CHI_2026_program.json` (from https://programs.sigchi.org/chi/2026 — saved in this repo).
-- Script: `download_pdfs.py`.
+- Input: any program JSON from `https://programs.sigchi.org/<event>/<year>` (e.g. `programs/CHI_2026_program.json`, saved in this repo as a sample).
+- Script: `download_pdfs.py <path-to-program.json>`.
 - Mechanism: launches **real Google Chrome** via Playwright with `playwright-stealth` and a persistent profile, clears one Cloudflare challenge, then pulls PDFs via the shared cookie jar.
-- Output: `pdfs/<safe-title> [<doi-with-underscores>].pdf`. Logs → `download.log`. Failures → `failed.tsv`. Re-running skips already-downloaded files.
+- Output: `pdfs/<program-stem>/<safe-title> [<doi-with-underscores>].pdf`. Logs → `<program-stem>.download.log`. Failures → `<program-stem>.failed.tsv`. Re-running skips already-downloaded files.
+- Content types (`--types`) are read from the JSON's `contentTypes` list at runtime — any name in there (case-insensitive), or `all`, works.
 
 ## Why this is harder than it looks
 
@@ -37,21 +39,20 @@ ACM DL is behind Cloudflare. The following approaches **all fail** (don't waste 
 
 ## Setup
 
+Dependencies are managed by [uv](https://docs.astral.sh/uv/) via `pyproject.toml`.
+
 ```bash
 cd /path/to/CHI2026
-
-python3 -m venv .venv
-.venv/bin/pip install -q playwright playwright-stealth
-.venv/bin/playwright install chromium   # optional — the script actually uses system Chrome
+uv sync                      # installs playwright + playwright-stealth
 ```
+
+A `.envrc` with `layout_uv` is included — if you use `direnv`, run `direnv allow` once and the venv is auto-activated on `cd`. Otherwise prefix commands with `uv run` (examples below).
 
 Nothing else. `requests`, `curl_cffi`, `cloudscraper`, `nodriver` are **not** needed — don't install them.
 
 ## Input data
 
-`CHI_2026_program.json` — the full program export from
-`https://programs.sigchi.org/chi/2026` (JSON download button in the UI, or the
-"Export" endpoint). Structure (relevant fields only):
+Drop program JSONs into `programs/` (e.g. `programs/CHI_2026_program.json`, `programs/CSCW_2025_program.json`). Grab them from `https://programs.sigchi.org/<event>/<year>` via the JSON download button / Export endpoint. Structure (relevant fields only):
 
 ```jsonc
 {
@@ -78,24 +79,29 @@ Counts in the 2026 export:
 ## Usage
 
 ```bash
-# Default: all 1702 Papers
-.venv/bin/python download_pdfs.py
+# Default: just Papers from the given program
+uv run download_pdfs.py programs/CHI_2026_program.json
 
-# Specific types (comma-separated)
-.venv/bin/python download_pdfs.py --types=paper,poster,journal
+# Specific types (comma-separated; names come from the JSON's contentTypes)
+uv run download_pdfs.py programs/CHI_2026_program.json --types=paper,poster,journal
 
-# Everything with a DOI (~2721 entries)
-.venv/bin/python download_pdfs.py --types=all
+# Everything with a DOI
+uv run download_pdfs.py programs/CHI_2026_program.json --types=all
 
 # Smoke test
-.venv/bin/python download_pdfs.py --types=paper --limit=3
+uv run download_pdfs.py programs/CHI_2026_program.json --types=paper --limit=3
 
-# Tune politeness (default 2s between downloads)
-.venv/bin/python download_pdfs.py --delay=3
+# Tune politeness (default 1.5s between downloads)
+uv run download_pdfs.py programs/CHI_2026_program.json --delay=3
 
 # Custom output dir
-.venv/bin/python download_pdfs.py --out=/some/other/dir
+uv run download_pdfs.py programs/CHI_2026_program.json --out=/some/other/dir
+
+# Other SIGCHI events work the same way
+uv run download_pdfs.py programs/CSCW_2025_program.json --types=paper,poster
 ```
+
+With `direnv` active you can drop the `uv run` prefix and just run `python download_pdfs.py …`.
 
 Valid `--types` values: `paper, poster, journal, demo, panel, keynote, award, workshop, course, meetup, src, mentoring, plaza, global, event, break, all`.
 
@@ -104,15 +110,15 @@ Valid `--types` values: `paper, poster, journal, demo, panel, keynote, award, wo
 `download.log` is append-only, so you can `nohup` or `tmux` and come back:
 
 ```bash
-nohup .venv/bin/python download_pdfs.py --types=paper > download.log 2>&1 &
-tail -f download.log
+nohup uv run download_pdfs.py programs/CHI_2026_program.json --types=paper > run.out 2>&1 &
+tail -f CHI_2026_program.download.log
 ```
 
 Re-running the same command after an interrupt **resumes** — existing PDFs in the output dir are skipped.
 
 ## How it works
 
-1. **Load entries**: parse `CHI_2026_program.json`, filter by `typeId`, extract DOI from `addons.doi.url` via regex `10\.\d{4,9}/\S+`.
+1. **Load entries**: parse `programs/CHI_2026_program.json`, filter by `typeId`, extract DOI from `addons.doi.url` via regex `10\.\d{4,9}/\S+`.
 2. **Launch Chrome**: `launch_persistent_context` with `channel="chrome"` so Cloudflare sees a real Chrome fingerprint. Profile lives in `.chrome-profile/` (cf_clearance persists there between runs, but not long enough to matter — CF re-issues it quickly).
 3. **Clear Cloudflare**: navigate to `https://dl.acm.org/doi/<first-doi>`, wait for the page title to stop being "Just a moment…" (usually 2–5 s).
 4. **Download loop**: for each DOI, `ctx.request.get("https://dl.acm.org/doi/pdf/<doi>")`. This reuses the browser's cookie jar (including `cf_clearance`) but doesn't render, so it's fast.
@@ -122,12 +128,12 @@ Re-running the same command after an interrupt **resumes** — existing PDFs in 
 ## Output
 
 ```
-pdfs/
+pdfs/<program-stem>/
   Rethinking External Communication of Autonomous Vehicles_ … [10.1145_3772318.3790431].pdf
   …
-download.log       # one line per attempt, timestamped
-failed.tsv         # doi<TAB>title<TAB>last_error — re-runnable by filtering the JSON to these DOIs
-.chrome-profile/   # Playwright's persistent Chrome profile (keep or delete, doesn't matter much)
+<program-stem>.download.log    # one line per attempt, timestamped
+<program-stem>.failed.tsv      # doi<TAB>title<TAB>last_error — re-runnable by filtering the JSON to these DOIs
+.chrome-profile/               # Playwright's persistent Chrome profile (shared across events)
 ```
 
 Filenames: title is sanitized (bad chars → `_`, truncated to 120 chars) and the DOI (with `/` → `_`) is appended in brackets as a stable ID.
